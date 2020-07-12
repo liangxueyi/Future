@@ -1,0 +1,147 @@
+import pandas as pd
+SYMBOL = 'SHFE.ni2008.'
+data=pd.read_pickle('~/xueyi/ni2008.pkl')
+
+data=data.drop([SYMBOL+'last_price',SYMBOL+'bid_price1',SYMBOL+'bid_volume1',
+          SYMBOL+'ask_price1',SYMBOL+'ask_volume1',SYMBOL+'volume',SYMBOL+'amount',SYMBOL+'open_interest',
+          'datetime','prior_bid_price','prior_bid_volume','prior_ask_price','prior_ask_volume'],axis=1)
+
+#分钟 成交价差，成交量差，卖单量查，卖单价差，买单量差，买单价差，买卖之间总价差分，仓位差，最高，最低
+#上面所有方差的差 （除仓位差，最高，最低外）
+
+#标签是成交均价 不同 10（1格）。
+data['tick_ask_amount']=data['tick_ask_volume']*data['tick_ask_price']
+data['tick_bid_amount']=data['tick_bid_volume']*data['tick_bid_price']
+
+min_data=data.groupby(['date','hour','minute','trade_time'])[['tick_open_interest','tick_amount','tick_ask_amount','tick_bid_amount','tick_volume','tick_ask_volume','tick_bid_volume']].sum().reset_index(drop=False)
+min_data.columns=['date','hour','minute','trade_time','open_interest','amount','ask_amount','bid_amount','volume','ask_volume','bid_volume']
+
+min_data[['amount_std','ask_amount_std','bid_amount_std','volume_std','ask_volume_std','bid_volume_std']]=\
+data.groupby(['date','hour','minute','trade_time'])[['tick_amount','tick_ask_amount','tick_bid_amount','tick_volume','tick_ask_volume','tick_bid_volume']].std().reset_index(drop=True)
+
+min_data[['lowest']]=data.groupby(['date','hour','minute','trade_time'])[['SHFE.ni2008.lowest']].min().reset_index(drop=True)
+min_data[['highest']]=data.groupby(['date','hour','minute','trade_time'])[['SHFE.ni2008.highest']].max().reset_index(drop=True)
+min_data['mean_price']=min_data['amount']/min_data['volume'].apply(lambda x:x+1.e-9)
+
+def label_func(x):
+    if x>10:
+        return 1
+#    elif x<-10:
+#        return 2
+    else:
+        return 0
+
+min_data['label']=(min_data.mean_price.shift(-1)-min_data.mean_price).apply(label_func)
+min_data=min_data[min_data.trade_time.shift(-1)==min_data.trade_time]
+
+from datetime import datetime,time,date
+train=min_data[min_data.date<=date(year=2020,month=6,day=15)]
+test=min_data[min_data.date>date(year=2020,month=6,day=15)]
+
+standDict={}
+for col in train.columns:
+    if col not in ['date','hour','minute','trade_time','label']:
+        tempDict={}
+        
+        tempDict['mean']=train[col].dropna().mean()
+        tempDict['std']=train[col].dropna().std()
+        
+        train[col]=train[col].apply(lambda x: (x-tempDict['mean'])/tempDict['std'])
+        standDict[col]=tempDict
+
+import numpy as np
+window=10
+
+def train_generator():
+    data=train[['trade_time','open_interest','amount','ask_amount','bid_amount','volume','ask_volume','bid_volume','label']].values
+    batch_size=2000
+    global_pointer=0
+    
+    while global_pointer<=data.shape[0]:
+        x=np.zeros((batch_size,window,data.shape[1]-2))
+        #x=np.zeros((batch_size,100))
+        y=np.zeros((batch_size,1))
+        
+        i=0
+        while i<batch_size and global_pointer<=data.shape[0]:
+            sub_data=data[global_pointer-window:global_pointer,:]
+            
+            if sub_data.shape[0]==window and sub_data[:,0].min()==sub_data[:,0].max() and np.isnan(sub_data).sum()==0:
+                
+                #y[i,:]=tf.one_hot(sub_data[-1,-1],depth=3).numpy()
+                y[i,:]=sub_data[-1,-1]
+                x[i,:,:]=(sub_data-sub_data[-1])[:,1:-1]
+                
+                i=i+1
+            global_pointer=global_pointer+1
+        
+        x=x[:i+1,:,:]
+#        x=x[:i+1,:]
+        y=y[:i+1,:]
+        yield (x,y)
+
+a=train_generator()
+for i in a:
+    print(i[0].shape)
+    print(i[1].shape)
+
+def test_generator():
+    data=test[['trade_time','open_interest','amount','ask_amount','bid_amount','volume','ask_volume','bid_volume','lowest','highest','mean_price','label']].values
+    batch_size=2000
+    global_pointer=0
+    
+    while global_pointer<=data.shape[0]:
+        x=np.zeros((batch_size,window,data.shape[1]-2))
+        #x=np.zeros((batch_size,100))
+        y=np.zeros((batch_size,1))
+        
+        i=0
+        while i<batch_size and global_pointer<=data.shape[0]:
+            sub_data=data[global_pointer-window:global_pointer,:]
+            
+            if sub_data.shape[0]==window and sub_data[:,0].min()==sub_data[:,0].max() and np.isnan(sub_data).sum()==0:
+                
+                #y[i,:]=tf.one_hot(sub_data[-1,-1],depth=3).numpy()
+                y[i,:]=sub_data[-1,-1]
+                x[i,:,:]=(sub_data-sub_data[-1])[:,1:-1]
+                
+                i=i+1
+            global_pointer=global_pointer+1
+        
+        x=x[:i+1,:,:]
+#        x=x[:i+1,:]
+        y=y[:i+1,:]
+        yield (x,y)
+
+import tensorflow as tf
+physical_devices = tf.config.experimental.list_physical_devices('GPU')
+assert len(physical_devices) > 0, "Not enough GPU hardware devices available"
+tf.config.experimental.set_memory_growth(physical_devices[0], True)
+
+train_gen=tf.data.Dataset.from_generator(train_generator,output_types=(tf.float32,tf.float32),
+                                            output_shapes=(tf.TensorShape([None,None,None]),tf.TensorShape([None,None])))
+test_gen=tf.data.Dataset.from_generator(test_generator,output_types=(tf.float32,tf.float32),
+                                            output_shapes=(tf.TensorShape([None,None,None]),tf.TensorShape([None,None])))
+#train_gen=tf.data.Dataset.from_generator(train_generator,output_types=(tf.float32,tf.float32),
+#                                         output_shapes=(tf.TensorShape([None,None]),tf.TensorShape([None,None])))
+
+
+from tensorflow import keras,math
+from tensorflow.keras import layers,Input,Model,losses,optimizers, metrics, callbacks,initializers
+
+inputs=Input(shape=(window,7),name='input_data')
+x=layers.LSTM(32)(inputs)
+x=layers.Dense(16,activation='relu')(x)
+outputs=layers.Dense(1,activation='sigmoid')(x)
+
+model=Model(inputs=inputs,outputs=outputs)
+
+model.compile(optimizer=optimizers.SGD(),
+              loss=losses.BinaryCrossentropy(),
+              metrics=[metrics.AUC(),metrics.Recall(),metrics.Precision()]
+)
+
+history=model.fit(
+                 x=train_gen,
+                 validation_data=test_gen,
+                 epochs=50)
